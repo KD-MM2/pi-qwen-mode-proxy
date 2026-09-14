@@ -33,13 +33,16 @@ export interface ModeParams {
 
 /**
  * A sampling profile: the six sampling parameters plus an optional
- * thinking override. When `thinking` is set, the extension syncs pi's
- * thinking level whenever the profile becomes active: `true` turns
- * thinking on (restoring the user's last non-off level), `false` turns
- * it off. Omitted → the thinking level is left untouched.
+ * thinking override and an optional free-form description. When
+ * `thinking` is set, the extension syncs pi's thinking level whenever
+ * the profile becomes active: `true` turns thinking on (restoring the
+ * user's last non-off level), `false` turns it off. Omitted → the
+ * thinking level is left untouched. `description` is display-only
+ * (profile list, picker, autocomplete) — never injected into requests.
  */
 export interface ProfileDef extends ModeParams {
 	thinking?: boolean;
+	description?: string;
 }
 
 /** Persisted profile store: named profiles + the active one. */
@@ -110,7 +113,6 @@ export const PARAM_KEYS: (keyof ModeParams)[] = [
  * https://unsloth.ai/docs/models/qwen3.6
  */
 export const DEFAULT_PROFILES: Record<string, ProfileDef> = {
-	/** Thinking (Qwen3.8 thinking mode) — creative, exploratory, maximises diversity */
 	thinking: {
 		temperature: 1.0,
 		top_p: 0.95,
@@ -119,8 +121,8 @@ export const DEFAULT_PROFILES: Record<string, ProfileDef> = {
 		presence_penalty: 0.0,
 		repetition_penalty: 1.0,
 		thinking: true,
+		description: "Qwen3.8 thinking — creative, exploratory, maximises diversity",
 	},
-	/** Coding (Qwen3.6 Thinking Precise) — precise, deterministic, low temperature */
 	coding: {
 		temperature: 0.6,
 		top_p: 0.95,
@@ -129,8 +131,8 @@ export const DEFAULT_PROFILES: Record<string, ProfileDef> = {
 		presence_penalty: 0.0,
 		repetition_penalty: 1.0,
 		thinking: true,
+		description: "Qwen3.6 Thinking Precise — precise, deterministic, low temperature",
 	},
-	/** Instruct (Qwen3.8 instruct / Qwen3.6 Instruct General) — balanced, presence penalty for variety */
 	instruct: {
 		temperature: 0.7,
 		top_p: 0.8,
@@ -139,8 +141,8 @@ export const DEFAULT_PROFILES: Record<string, ProfileDef> = {
 		presence_penalty: 1.5,
 		repetition_penalty: 1.0,
 		thinking: false,
+		description: "Qwen3.8 instruct / Qwen3.6 Instruct General — balanced, presence penalty for variety",
 	},
-	/** Reasoning (Qwen3.6 Instruct Reasoning / Thinking General) — analytical, non-thinking */
 	reasoning: {
 		temperature: 1.0,
 		top_p: 0.95,
@@ -149,6 +151,7 @@ export const DEFAULT_PROFILES: Record<string, ProfileDef> = {
 		presence_penalty: 1.5,
 		repetition_penalty: 1.0,
 		thinking: false,
+		description: "Qwen3.6 Instruct Reasoning / Thinking General — analytical, non-thinking",
 	},
 };
 
@@ -250,6 +253,10 @@ export type ValidationResult =
  *
  * An optional `thinking` boolean (syncs pi's thinking level when the
  * profile is active) is preserved; if present it must be a boolean.
+ *
+ * An optional `description` string (shown in the profile list and
+ * picker) is preserved; if present it must be a string. Blank
+ * descriptions are dropped.
  */
 export function validateParams(input: unknown): ValidationResult {
 	if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -307,6 +314,18 @@ export function validateParams(input: unknown): ValidationResult {
 			};
 		}
 		params.thinking = obj["thinking"];
+	}
+
+	if ("description" in obj) {
+		const description = obj["description"];
+		if (typeof description !== "string") {
+			return {
+				ok: false,
+				error: `"description" must be a string (got ${JSON.stringify(description)})`,
+			};
+		}
+		const trimmed = description.trim();
+		if (trimmed) params.description = trimmed;
 	}
 	return { ok: true, params };
 }

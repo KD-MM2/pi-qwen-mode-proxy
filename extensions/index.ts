@@ -7,8 +7,8 @@
  * the active profile.
  *
  * Profiles are user-managed (add / edit / delete / switch) and persisted
- * to ~/.config/qwen-mode-proxy/profiles.json. Three defaults are seeded
- * on first run: thinking, coding, instruct.
+ * to ~/.config/qwen-mode-proxy/profiles.json. Four defaults are seeded
+ * on first run: thinking, reasoning, coding, instruct.
  *
  * Parameters are injected only for requests whose model or provider
  * name contains "llama" or "qwen" (case-insensitive).
@@ -80,10 +80,14 @@ function paramsToTemplate(p: ProfileDef): string {
 function renderProfileList(config: ProfileConfig): string[] {
 	const names = Object.keys(config.profiles);
 	const lines: string[] = [`🎛 Qwen profiles — active: ${config.current}`];
-	const maxShown = 6;
+	const maxShown = 3;
 	for (const name of names.slice(0, maxShown)) {
+		const def = config.profiles[name];
 		const marker = name === config.current ? "●" : "○";
-		lines.push(`${marker} ${name}  ${paramsSummary(config.profiles[name])}`);
+		const desc = def.description;
+		const shown = desc && desc.length > 60 ? `${desc.slice(0, 59)}…` : desc;
+		lines.push(shown ? `${marker} ${name} — ${shown}` : `${marker} ${name}`);
+		lines.push(`  ${paramsSummary(def)}`);
 	}
 	if (names.length > maxShown) {
 		lines.push(`… +${names.length - maxShown} more`);
@@ -156,9 +160,17 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function pickProfile(ctx: ExtensionContext): Promise<string | undefined> {
-		const names = Object.keys(ensureConfig().profiles);
+		const cfg = ensureConfig();
+		const names = Object.keys(cfg.profiles);
 		if (names.length === 0) return undefined;
-		return await ctx.ui.select("Select a profile", names);
+		const options = names.map((n) => {
+			const desc = cfg.profiles[n].description;
+			return desc ? `${n} — ${desc}` : n;
+		});
+		const picked = await ctx.ui.select("Select a profile", options);
+		// Profile names never contain " — " (isValidName), so the first
+		// segment of the option string is the name.
+		return picked?.split(" — ")[0];
 	}
 
 	/**
@@ -175,7 +187,7 @@ export default function (pi: ExtensionAPI) {
 			return undefined;
 		}
 		const edited = await ctx.ui.editor(
-			`Profile "${name}" — edit the sampling parameters (JSON). Optional "thinking": true|false syncs pi's thinking level:`,
+			`Profile "${name}" — edit the sampling parameters (JSON). Optional "thinking": true|false syncs pi's thinking level; optional "description" is shown in the profile list:`,
 			paramsToTemplate(existing),
 		);
 		if (edited === undefined) {
@@ -354,15 +366,20 @@ export default function (pi: ExtensionAPI) {
 			"Qwen sampling profiles: /mode [list|new [name]|edit <name>|delete <name>|<profile>]",
 		getArgumentCompletions: (prefix) => {
 			const p = prefix.toLowerCase();
+			const profiles = ensureConfig().profiles;
 			const items = [
 				...SUBCOMMANDS.filter((s) => s.startsWith(p)).map((s) => ({
 					value: s,
 					label: s,
 					description: "subcommand",
 				})),
-				...Object.keys(ensureConfig().profiles)
+				...Object.keys(profiles)
 					.filter((n) => n.startsWith(p))
-					.map((n) => ({ value: n, label: n, description: "switch to profile" })),
+					.map((n) => ({
+						value: n,
+						label: n,
+						description: profiles[n].description ?? "switch to profile",
+					})),
 			];
 			return items.length > 0 ? items : null;
 		},

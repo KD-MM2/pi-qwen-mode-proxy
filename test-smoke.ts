@@ -42,6 +42,10 @@ function check(name: string, cond: boolean): void {
 	check("defaults: coding flag on", cfg.profiles["coding"].thinking === true);
 	check("defaults: reasoning flag off", cfg.profiles["reasoning"].thinking === false);
 	check("defaults: instruct flag off", cfg.profiles["instruct"].thinking === false);
+	check(
+		"defaults: all profiles have descriptions",
+		Object.values(cfg.profiles).every((p) => typeof p.description === "string" && p.description.length > 0),
+	);
 }
 
 // ── save / load round-trip (incl. thinking flag) ────────────────────
@@ -55,6 +59,7 @@ function check(name: string, cond: boolean): void {
 		presence_penalty: 0.5,
 		repetition_penalty: 1.1,
 		thinking: false,
+		description: "low-temperature chat",
 	};
 	cfg.current = "custom";
 	saveConfig(cfg);
@@ -62,6 +67,7 @@ function check(name: string, cond: boolean): void {
 	const reloaded = loadConfig();
 	check("roundtrip: custom kept", reloaded.profiles["custom"]?.temperature === 0.3);
 	check("roundtrip: thinking flag kept", reloaded.profiles["custom"]?.thinking === false);
+	check("roundtrip: description kept", reloaded.profiles["custom"]?.description === "low-temperature chat");
 	check("roundtrip: current kept", reloaded.current === "custom");
 }
 
@@ -175,6 +181,18 @@ function check(name: string, cond: boolean): void {
 
 	const tNum = validateParams({ ...base, thinking: 1 });
 	check("validate: thinking number errors", !tNum.ok);
+
+	// description field
+	const dOk = validateParams({ ...base, description: "  my note  " });
+	check("validate: description ok", dOk.ok);
+	if (dOk.ok) check("validate: description trimmed and kept", dOk.params.description === "my note");
+
+	const dBlank = validateParams({ ...base, description: "   " });
+	check("validate: blank description ok", dBlank.ok);
+	if (dBlank.ok) check("validate: blank description dropped", dBlank.params.description === undefined);
+
+	const dNum = validateParams({ ...base, description: 42 });
+	check("validate: non-string description errors", !dNum.ok);
 
 	const unknown = validateParams({ ...base, surprise: 42 });
 	check("validate: unknown key ignored", unknown.ok);

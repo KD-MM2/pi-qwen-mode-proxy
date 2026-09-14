@@ -2,7 +2,7 @@
 
 Sampling profile proxy for Qwen/llama.cpp models served via an OpenAI-compatible endpoint (tested with Qwen 3.8 27B on llama.cpp).
 
-Instead of a fixed set of modes, you manage your own **sampling profiles** — named sets of the six sampling parameters (`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `repetition_penalty`) plus an optional `thinking` flag that syncs pi's thinking level. The active profile is injected into every OpenAI-completions request to a matching model.
+Instead of a fixed set of modes, you manage your own **sampling profiles** — named sets of the six sampling parameters (`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `repetition_penalty`) plus an optional `thinking` flag that syncs pi's thinking level and an optional free-form `description` shown in the profile list and picker. The active profile is injected into every OpenAI-completions request to a matching model.
 
 ## Default profiles
 
@@ -39,7 +39,7 @@ pi clamps the requested level to the active model's capabilities, and the extens
 | --------- | ------------- |
 | `/mode` | Show the active profile and list all profiles |
 | `/mode <name>` | Switch to profile `<name>` |
-| `/mode list` | List all profiles |
+| `/mode list` | List all profiles with their parameters and descriptions |
 | `/mode new <name>` | Create a profile (JSON editor opens, pre-filled from the active profile) |
 | `/mode edit [name]` | Edit a profile (JSON editor) |
 | `/mode delete <name>` | Delete a profile (with confirmation) |
@@ -76,7 +76,7 @@ Profiles are stored in `~/.config/qwen-mode-proxy/profiles.json` (or `$XDG_CONFI
 {
   "profiles": {
     "thinking": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0, "repetition_penalty": 1.0, "thinking": true },
-    "my-profile": { "temperature": 0.3, "top_p": 0.5, "top_k": 40, "min_p": 0.05, "presence_penalty": 0.5, "repetition_penalty": 1.1, "thinking": false }
+    "my-profile": { "temperature": 0.3, "top_p": 0.5, "top_k": 40, "min_p": 0.05, "presence_penalty": 0.5, "repetition_penalty": 1.1, "thinking": false, "description": "low-temperature chat" }
   },
   "current": "coding",
   "lastThinkingLevel": "high"
@@ -86,6 +86,8 @@ Profiles are stored in `~/.config/qwen-mode-proxy/profiles.json` (or `$XDG_CONFI
 The file is created on first run; you can also hand-edit it while pi/omp is not running. `lastThinkingLevel` is maintained automatically by the extension — hand-editing it is possible but it will be overwritten the next time you change the thinking level.
 
 Profile JSON also accepts `repeat_penalty` as an alias for `repetition_penalty` (llama.cpp's name for the same parameter, used by unsloth's preset dicts). The injected payload carries both names, so OpenAI-compatible and raw llama.cpp endpoints both pick it up.
+
+Profiles may also carry an optional `description` — free-form text shown in the `/mode` list, the profile picker, and command autocomplete. It is display-only and never injected into requests.
 
 ### Model matching
 
