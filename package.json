@@ -1,7 +1,7 @@
 {
   "name": "pi-qwen-mode-proxy",
-  "version": "1.0.0",
-  "description": "Sampling mode proxy for Qwen models served via llama.cpp — switch between thinking, coding, and instruct modes",
+  "version": "1.2.0",
+  "description": "Sampling profile proxy for Qwen/llama.cpp models — user-managed sampling profiles injected into OpenAI-completions requests.",
   "license": "MIT",
   "homepage": "https://github.com/darthrax/pi-qwen-mode-proxy",
   "repository": {
@@ -11,16 +11,29 @@
   "keywords": [
     "pi-package",
     "pi-extension",
+    "omp-extension",
+    "oh-my-pi",
     "qwen",
     "llama.cpp",
-    "llamacpp"
+    "llamacpp",
+    "sampling"
   ],
   "main": "extensions/index.ts",
   "type": "module",
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@types/node": "^26.5.1",
+    "typescript": "^7.0.2"
   },
   "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "omp": {
     "extensions": [
       "./extensions"
     ]
