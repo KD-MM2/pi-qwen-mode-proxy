@@ -80,12 +80,90 @@ export const THINKING_LEVELS = [
 
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-/** Coerce a persisted value to a valid thinking level, or undefined. */
-function asThinkingLevel(value: unknown): ThinkingLevel | undefined {
+/** Coerce a persisted or reported value to a valid thinking level, or undefined. */
+export function toThinkingLevel(value: unknown): ThinkingLevel | undefined {
 	return typeof value === "string" &&
 		(THINKING_LEVELS as readonly string[]).includes(value)
 		? (value as ThinkingLevel)
 		: undefined;
+}
+
+/**
+ * A reported session level that counts as "thinking on": any known
+ * level except "off". "inherit" (omp's auto state) is not a concrete
+ * level and is treated as unknown; runtimes report the resolved
+ * effective level anyway.
+ */
+export function asOnLevel(value: unknown): ThinkingLevel | undefined {
+	const level = toThinkingLevel(value);
+	return level && level !== "off" ? level : undefined;
+}
+
+/**
+ * Decide what to do to the session's thinking level when `profile`
+ * becomes active.
+ *
+ * Runtimes differ in what "off" means: pi can truly switch thinking
+ * off, but omp clamps "off" to the model's minimum effort on models
+ * that require effort (Qwen 3.8 on llama.cpp rejects
+ * enable_thinking:false, so "off" reports back as "low"). The
+ * decision therefore never compares against the literal "off" — it
+ * compares against `appliedLevel`, what this extension last did:
+ *
+ * - thinking omitted → "none" (never touch).
+ * - thinking: false → "off" (set the level to off; clamped to the
+ *   minimum effort by runtimes that cannot fully disable).
+ * - thinking: true + we last turned it off, or the session reports
+ *   thinking off → "on" (restore the remembered level).
+ * - thinking: true + already on and we did not turn it off → "none"
+ *   (the current level is user-owned; do not stomp manual tweaks).
+ */
+export function planThinkingApply(
+	profile: ProfileDef,
+	reportedLevel: unknown,
+	appliedLevel: ThinkingLevel | undefined,
+): "none" | "on" | "off" {
+	if (profile.thinking === false) return "off";
+	if (profile.thinking !== true) return "none";
+	if (appliedLevel !== "off" && asOnLevel(reportedLevel)) return "none";
+	return "on";
+}
+
+/**
+ * Decide whether a live level read is the user's preference worth
+ * remembering as the "last on level". omp fires no thinking-level
+ * events, so the level is sampled on every request instead.
+ *
+ * When the extension itself turned thinking off on a requiresEffort
+ * model, the runtime reports the clamped minimum effort (`offLevel`)
+ * instead of "off" — that is our own off state, not a preference, so
+ * it is skipped. Any other reported on level is user-owned (a manual
+ * selection in the runtime UI) and is remembered.
+ */
+export function shouldRememberLevel(
+	profile: ProfileDef,
+	reportedLevel: unknown,
+	appliedLevel: ThinkingLevel | undefined,
+	offLevel: string,
+): boolean {
+	const on = asOnLevel(reportedLevel);
+	if (!on) return false;
+	return !(profile.thinking === false && appliedLevel === "off" && on === offLevel);
+}
+
+/**
+ * User-facing note for when "off" was clamped: the runtime could not
+ * fully disable thinking (requiresEffort model) and reports the
+ * minimum effort instead of "off". When `hardOff` is true the
+ * extension forces enable_thinking:false on the wire for Qwen models,
+ * so no thinking is actually emitted — the note explains the cosmetic
+ * discrepancy. `undefined` when the level really is off.
+ */
+export function clampedOffNote(offLevel: string, hardOff: boolean): string | undefined {
+	if (offLevel === "off") return undefined;
+	return hardOff
+		? `thinking off — runtime reports ${offLevel} (clamped), but the wire sends enable_thinking:false — no thinking emitted`
+		: `thinking off — model keeps minimum effort (${offLevel}); Ctrl+T toggles thinking blocks`;
 }
 
 /** Structural view of the session model (pi `Model` satisfies this). */
@@ -208,7 +286,7 @@ export function loadConfig(): ProfileConfig {
 			typeof parsed.current === "string" && profiles[parsed.current]
 				? parsed.current
 				: Object.keys(profiles)[0];
-		return { profiles, current, version: CONFIG_VERSION, lastThinkingLevel: asThinkingLevel(parsed.lastThinkingLevel) };
+		return { profiles, current, version: CONFIG_VERSION, lastThinkingLevel: toThinkingLevel(parsed.lastThinkingLevel) };
 	} catch {
 		return { profiles: { ...DEFAULT_PROFILES }, current: "thinking", version: CONFIG_VERSION };
 	}
@@ -353,15 +431,17 @@ export function parseJson<T>(text: string): { ok: true; value: T } | { ok: false
  */
 const TARGET_PATTERN = /llama|qwen/i;
 
+/** Qwen models only — `enable_thinking` is Qwen template semantics. */
+const QWEN_PATTERN = /qwen/i;
+
 /**
- * Decide whether sampling parameters should be injected for this
- * request. Checks the request payload's `model` field plus the live
- * session model's id/name/provider.
+ * Collect the model identifiers known for a request: the payload's
+ * `model` field plus the live session model's id/name/provider.
  */
-export function isTargetModel(
+function modelCandidates(
 	payload: unknown,
 	model: ModelIdentity | undefined,
-): boolean {
+): string[] {
 	const candidates: string[] = [];
 	if (payload && typeof payload === "object") {
 		const m = (payload as Record<string, unknown>).model;
@@ -372,5 +452,57 @@ export function isTargetModel(
 		if (typeof model.name === "string") candidates.push(model.name);
 		if (typeof model.provider === "string") candidates.push(model.provider);
 	}
-	return candidates.some((s) => TARGET_PATTERN.test(s));
+	return candidates;
+}
+
+/**
+ * Decide whether sampling parameters should be injected for this
+ * request.
+ */
+export function isTargetModel(
+	payload: unknown,
+	model: ModelIdentity | undefined,
+): boolean {
+	return modelCandidates(payload, model).some((s) => TARGET_PATTERN.test(s));
+}
+
+/** True when the request targets a Qwen model (payload or session). */
+export function isQwenModel(
+	payload: unknown,
+	model: ModelIdentity | undefined,
+): boolean {
+	return modelCandidates(payload, model).some((s) => QWEN_PATTERN.test(s));
+}
+
+/**
+ * Force true thinking-off on an outgoing Qwen payload.
+ *
+ * On requiresEffort models (Qwen 3.8 on llama.cpp) the runtime clamps
+ * "off" to the minimum effort, so the payload still carries effort
+ * fields that re-enable thinking. This strips the effort carriers —
+ * `reasoning: { effort }` (Responses wire), top-level
+ * `reasoning_effort` (Completions wire), and `reasoning_effort` inside
+ * `chat_template_kwargs` — and forces `enable_thinking: false`
+ * (top-level when present, plus `chat_template_kwargs`). The
+ * Qwen3-style llama.cpp chat template maps that to /no_think: zero
+ * thinking tokens. Verified live against a Qwen3.8-27B server on both
+ * /v1/responses and /v1/chat/completions, including with
+ * `reasoning: { effort: "low" }` still present (the kwarg wins).
+ *
+ * Mutates `payload`. Returns true when rewritten.
+ */
+export function applyHardOff(
+	payload: Record<string, unknown>,
+	model: ModelIdentity | undefined,
+): boolean {
+	if (!isQwenModel(payload, model)) return false;
+	if (payload.reasoning !== undefined) delete payload.reasoning;
+	if (payload.reasoning_effort !== undefined) delete payload.reasoning_effort;
+	if (typeof payload.enable_thinking === "boolean") payload.enable_thinking = false;
+	const prev = (payload.chat_template_kwargs ?? {}) as Record<string, unknown>;
+	const kwargs: Record<string, unknown> = { ...prev };
+	delete kwargs.reasoning_effort;
+	kwargs.enable_thinking = false;
+	payload.chat_template_kwargs = kwargs;
+	return true;
 }

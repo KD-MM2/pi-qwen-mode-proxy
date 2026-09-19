@@ -18,10 +18,17 @@
  * - coding   — Precise, deterministic coding tasks. Lower temperature for consistent results.
  * - instruct — Instruction-following with presence penalty to encourage topic variety.
  *
- * Profiles may set "thinking": true|false. When a profile becomes active,
- * the extension syncs pi's thinking level: true turns thinking on (restoring
- * the user's last non-off level), false turns it off. pi-llama-cpp then
- * bridges that level to the server (enable_thinking / thinking_budget_tokens).
+ * Profiles may set "thinking": true|false. When a profile becomes
+ * active, the extension syncs the runtime's thinking level: true
+ * ensures thinking is on (restoring the remembered level when it was
+ * off), false sets it off. Runtimes that cannot fully disable
+ * thinking (omp on requiresEffort models, e.g. Qwen 3.8 on llama.cpp)
+ * clamp "off" to the minimum effort — the extension tracks that state
+ * itself, so the switch works on both pi and oh-my-pi. For Qwen
+ * models with a thinking:false profile, the extension additionally
+ * forces true off on the wire: it strips the clamped effort fields
+ * and sends enable_thinking:false, which the Qwen3-style llama.cpp
+ * chat template maps to /no_think (zero thinking tokens).
  *
  * Commands:
  * - /mode              — Show current profile + list all profiles
@@ -51,9 +58,15 @@ import {
 	isValidName,
 	parseJson,
 	validateParams,
+	asOnLevel,
+	clampedOffNote,
+	planThinkingApply,
+	shouldRememberLevel,
+	toThinkingLevel,
+	applyHardOff,
+	isQwenModel,
 	PARAM_KEYS,
 	DEFAULT_PROFILES,
-	type ModeParams,
 	type ProfileDef,
 	type ThinkingLevel,
 	type ProfileConfig,
@@ -101,10 +114,19 @@ function renderProfileList(config: ProfileConfig): string[] {
 
 export default function (pi: ExtensionAPI) {
 	let config: ProfileConfig | null = null;
-	// Last non-off thinking level the user selected; restored when a
-	// thinking profile is activated while thinking is off. Persisted in
-	// the config file so it survives across sessions.
+	// Last on thinking level the user chose; restored when a thinking
+	// profile is activated while thinking is off. Persisted in the
+	// config file so it survives across sessions.
 	let lastOnLevel: ThinkingLevel = "medium";
+	// What this extension last applied to the session level: a level
+	// after an "on" restore, "off" after turning it off, undefined
+	// when we have not touched it (user/session-owned).
+	let appliedLevel: ThinkingLevel | undefined;
+	// What the runtime reports right after we set "off": "off" in pi,
+	// the clamped minimum effort in omp on models that cannot fully
+	// disable thinking (Qwen 3.8 on llama.cpp rejects
+	// enable_thinking:false). Lets us recognize our own off state.
+	let offLevel = "off";
 
 	function ensureConfig(): ProfileConfig {
 		if (!config) config = loadConfig();
@@ -124,23 +146,37 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Sync pi's thinking level with the profile's `thinking` flag.
-	 * `true` only turns thinking on when it is off (restoring the user's
-	 * last non-off level); `false` only turns it off. Omitted → untouched.
-	 * Pi clamps the requested level to the active model's capabilities, so
-	 * the effective level is read back and remembered.
+	 * Sync the runtime's thinking level with the profile's `thinking`
+	 * flag, per `planThinkingApply`. After setting "off", remember
+	 * what the runtime actually reports (pi: "off"; omp on
+	 * requiresEffort models: the clamped minimum effort) so our own
+	 * off state is recognizable. After an "on" restore, read the
+	 * effective level back and remember it (the runtime clamps the
+	 * requested level to the model's capabilities).
+	 *
+	 * Returns a user-facing note when "off" was clamped to the
+	 * minimum effort, so the switch can explain itself.
 	 */
-	function applyThinking(profile: ProfileDef): void {
-		if (typeof profile.thinking !== "boolean") return;
-		const level = pi.getThinkingLevel();
-		if (profile.thinking) {
-			if (level !== "off") return;
-			pi.setThinkingLevel(lastOnLevel);
-			const effective = pi.getThinkingLevel();
-			if (effective !== "off") lastOnLevel = effective;
-		} else if (level !== "off") {
+	function applyThinking(profile: ProfileDef, ctx: ExtensionContext): string | undefined {
+		const action = planThinkingApply(profile, pi.getThinkingLevel(), appliedLevel);
+		if (action === "none") return undefined;
+		if (action === "off") {
 			pi.setThinkingLevel("off");
+			appliedLevel = "off";
+			const reported = pi.getThinkingLevel();
+			offLevel = typeof reported === "string" ? reported : "off";
+			return clampedOffNote(offLevel, isQwenModel(undefined, ctx.model));
 		}
+		pi.setThinkingLevel(lastOnLevel);
+		appliedLevel = lastOnLevel;
+		const effective = asOnLevel(pi.getThinkingLevel());
+		if (effective) lastOnLevel = effective;
+		return undefined;
+	}
+
+	/** Switch notification; appends the clamped-off note when present. */
+	function notify(ctx: ExtensionContext, base: string, note?: string): void {
+		ctx.ui.notify(note ? `${base} — ${note}` : base, "info");
 	}
 
 	function persist(ctx: ExtensionContext): void {
@@ -237,9 +273,9 @@ export default function (pi: ExtensionAPI) {
 		if (!params) return;
 		cfg.profiles[name] = params;
 		cfg.current = name;
-		applyThinking(params);
+		const note = applyThinking(params, ctx);
 		persist(ctx);
-		ctx.ui.notify(`✅ Created profile "${name}" and switched to it`, "info");
+		notify(ctx, `✅ Created profile "${name}" and switched to it`, note);
 	}
 
 	async function editProfile(ctx: ExtensionContext, argName?: string): Promise<void> {
@@ -257,9 +293,9 @@ export default function (pi: ExtensionAPI) {
 		const params = await editParams(ctx, name, cfg.profiles[name]);
 		if (!params) return;
 		cfg.profiles[name] = params;
-		if (cfg.current === name) applyThinking(params);
+		const note = cfg.current === name ? applyThinking(params, ctx) : undefined;
 		persist(ctx);
-		ctx.ui.notify(`✅ Updated profile "${name}"`, "info");
+		notify(ctx, `✅ Updated profile "${name}"`, note);
 	}
 
 	async function deleteProfile(ctx: ExtensionContext, argName?: string): Promise<void> {
@@ -288,9 +324,9 @@ export default function (pi: ExtensionAPI) {
 		}
 		delete cfg.profiles[name];
 		if (cfg.current === name) cfg.current = Object.keys(cfg.profiles)[0];
-		applyThinking(cfg.profiles[cfg.current]);
+		const note = applyThinking(cfg.profiles[cfg.current], ctx);
 		persist(ctx);
-		ctx.ui.notify(`🗑 Deleted profile "${name}" — now on "${cfg.current}"`, "info");
+		notify(ctx, `🗑 Deleted profile "${name}" — now on "${cfg.current}"`, note);
 	}
 
 	function switchProfile(ctx: ExtensionContext, name: string): void {
@@ -301,9 +337,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		cfg.current = key;
-		applyThinking(cfg.profiles[key]);
+		const note = applyThinking(cfg.profiles[key], ctx);
 		persist(ctx);
-		ctx.ui.notify(`🎛 Profile: ${key}`, "info");
+		notify(ctx, `🎛 Profile: ${key}`, note);
 	}
 
 	// ── Events ────────────────────────────────────────────────────────
@@ -312,12 +348,15 @@ export default function (pi: ExtensionAPI) {
 		config = loadConfig();
 		// Materialize the file on first run so users can find/edit it.
 		if (!configExists()) saveConfig(config);
-		// Restore the remembered level; a resumed session may already have
-		// restored one from pi's session history — prefer that (fresher).
-		const restored = pi.getThinkingLevel();
-		lastOnLevel =
-			restored !== "off" ? restored : config.lastThinkingLevel ?? "medium";
-		applyThinking(config.profiles[config.current] ?? DEFAULT_PROFILES.thinking);
+		// If the session already has thinking on (a resumed session
+		// restores its level from pi's session history), remember the
+		// live level — it is fresher; otherwise fall back to the
+		// persisted one.
+		const live = asOnLevel(pi.getThinkingLevel());
+		lastOnLevel = live ?? config.lastThinkingLevel ?? "medium";
+		appliedLevel = undefined;
+		offLevel = "off";
+		applyThinking(config.profiles[config.current] ?? DEFAULT_PROFILES.thinking, ctx);
 		updateUi(ctx);
 	});
 
@@ -331,6 +370,15 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_provider_request", (event, ctx) => {
 		if (!isTargetModel(event.payload, ctx.model)) return;
 		const params = activeParams();
+		// omp fires no thinking-level events, so the live level is
+		// sampled here: manual selections made in the runtime UI
+		// become the remembered "last on level". In-memory only —
+		// disk persistence happens on profile changes and shutdown.
+		const live = pi.getThinkingLevel();
+		if (shouldRememberLevel(params, live, appliedLevel, offLevel)) {
+			const on = asOnLevel(live);
+			if (on) lastOnLevel = on;
+		}
 		const payload = event.payload as Record<string, unknown>;
 		for (const key of PARAM_KEYS) {
 			payload[key] = params[key];
@@ -339,6 +387,10 @@ export default function (pi: ExtensionAPI) {
 		// OpenAI-compatible servers read `repetition_penalty`.
 		// Send both — each server ignores the other.
 		payload.repeat_penalty = params.repetition_penalty;
+		// thinking:false profiles force true off on the wire for Qwen
+		// models: the runtime's clamped "off" would otherwise re-enable
+		// minimum-effort thinking (see applyHardOff).
+		if (params.thinking === false) applyHardOff(payload, ctx.model);
 		return payload;
 	});
 
@@ -349,12 +401,23 @@ export default function (pi: ExtensionAPI) {
 
 	// Remember the user's preferred thinking level so profiles with
 	// thinking: true can restore it. Persisted across sessions via the
-	// config file. (No-op in runtimes without this event.)
+	// config file. Fires in pi; omp exposes the level through the
+	// API instead, sampled on every request in before_provider_request.
 	pi.on("thinking_level_select", (event) => {
-		if (event.level === "off") return;
-		lastOnLevel = event.level;
+		const level = toThinkingLevel(event.level);
+		if (!level) return;
+		if (level === "off") {
+			// User switched thinking off — treat it as this
+			// extension's own off state so a later thinking profile
+			// restores the remembered level instead of stomping it.
+			appliedLevel = "off";
+			offLevel = "off";
+			return;
+		}
+		lastOnLevel = level;
+		appliedLevel = undefined;
 		if (config) {
-			config.lastThinkingLevel = lastOnLevel;
+			config.lastThinkingLevel = level;
 			saveConfig(config);
 		}
 	});

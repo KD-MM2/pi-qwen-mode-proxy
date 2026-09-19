@@ -11,11 +11,20 @@ import {
 	isValidName,
 	parseJson,
 	isTargetModel,
+	isQwenModel,
+	applyHardOff,
 	loadConfig,
 	saveConfig,
 	getConfigPath,
 	configExists,
 	CONFIG_VERSION,
+	toThinkingLevel,
+	asOnLevel,
+	clampedOffNote,
+	planThinkingApply,
+	shouldRememberLevel,
+	DEFAULT_PROFILES,
+	type ProfileDef,
 } from "./extensions/config";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "qmp-test-"));
@@ -221,5 +230,124 @@ function check(name: string, cond: boolean): void {
 	check("target: non-string model", !isTargetModel({ model: 42 }, undefined));
 }
 
-console.log(`\n${pass} passed, ${fail} failed`);
+// ── thinking level helpers ──────────────────────────────────────────
+{
+	check("toThinkingLevel: valid level", toThinkingLevel("high") === "high");
+	check("toThinkingLevel: off is a level", toThinkingLevel("off") === "off");
+	check("toThinkingLevel: inherit is unknown", toThinkingLevel("inherit") === undefined);
+	check("toThinkingLevel: garbage rejected", toThinkingLevel("bogus") === undefined);
+	check("toThinkingLevel: non-string rejected", toThinkingLevel(3) === undefined);
+	check("asOnLevel: on-level passes", asOnLevel("low") === "low");
+	check("asOnLevel: off excluded", asOnLevel("off") === undefined);
+	check("asOnLevel: inherit excluded", asOnLevel("inherit") === undefined);
+}
+
+// ── planThinkingApply ───────────────────────────────────────────────
+{
+	const on: ProfileDef = { ...DEFAULT_PROFILES.thinking };
+	const off: ProfileDef = { ...DEFAULT_PROFILES.instruct };
+	const plain: ProfileDef = { ...DEFAULT_PROFILES.instruct, thinking: undefined };
+
+	check("plan: omitted flag → none", planThinkingApply(plain, "high", undefined) === "none");
+	check("plan: on + already on (user-owned) → none", planThinkingApply(on, "high", undefined) === "none");
+	check("plan: on + already on (we set it) → none", planThinkingApply(on, "xhigh", "xhigh") === "none");
+	check("plan: on + session off (pi) → on", planThinkingApply(on, "off", undefined) === "on");
+	check("plan: on + clamped minimum after our off (omp) → on", planThinkingApply(on, "low", "off") === "on");
+	check("plan: on + unknown reported while off → on", planThinkingApply(on, "inherit", "off") === "on");
+	check("plan: off + on → off", planThinkingApply(off, "high", undefined) === "off");
+	check("plan: off + already off (pi) → off", planThinkingApply(off, "off", undefined) === "off");
+	check("plan: off + clamped minimum → off (idempotent)", planThinkingApply(off, "low", "off") === "off");
+	check("plan: omitted + off → none", planThinkingApply(plain, "off", "off") === "none");
+}
+
+// ── shouldRememberLevel ─────────────────────────────────────────────
+{
+	const on: ProfileDef = { ...DEFAULT_PROFILES.thinking };
+	const off: ProfileDef = { ...DEFAULT_PROFILES.instruct };
+
+	check("remember: our clamped off state (omp) skipped", shouldRememberLevel(off, "low", "off", "low") === false);
+	check("remember: our off state (pi) skipped", shouldRememberLevel(off, "off", "off", "off") === false);
+	check("remember: manual selection while off-profile → remembered", shouldRememberLevel(off, "xhigh", "off", "low") === true);
+	check("remember: user minimum on off-profile (we didn't turn off) → remembered", shouldRememberLevel(off, "low", undefined, "off") === true);
+	check("remember: on-level on thinking profile → remembered", shouldRememberLevel(on, "medium", "medium", "off") === true);
+	check("remember: off never remembered", shouldRememberLevel(on, "off", undefined, "off") === false);
+	check("remember: inherit never remembered", shouldRememberLevel(on, "inherit", undefined, "off") === false);
+}
+
+// ── clampedOffNote ──────────────────────────────────────────────────
+{
+	check("note: real off → no note", clampedOffNote("off", false) === undefined);
+	check("note: real off → no note (hardOff)", clampedOffNote("off", true) === undefined);
+	const note = clampedOffNote("low", false);
+	check("note: clamped, no hard-off → explains minimum effort", note !== undefined && note.includes("low"));
+	check("note: clamped, no hard-off → points at Ctrl+T", note !== undefined && note.includes("Ctrl+T"));
+	const hard = clampedOffNote("low", true);
+	check("note: clamped + hard-off → mentions enable_thinking:false", hard !== undefined && hard.includes("enable_thinking:false"));
+	check("note: clamped + hard-off → reports the clamped level", hard !== undefined && hard.includes("low"));
+}
+
+// ── isQwenModel / applyHardOff ──────────────────────────────────────
+{
+	check("qwen: payload model matches", isQwenModel({ model: "Qwen3.8-27B" }, undefined) === true);
+	check("qwen: session model matches", isQwenModel({}, { id: "qwen3-30b-a3b", provider: "llama.cpp" }) === true);
+	check("qwen: non-qwen model rejected", isQwenModel({ model: "KAT-Coder-V2.5-Dev" }, { provider: "llama.cpp" }) === false);
+
+	// Responses wire (omp): reasoning: { effort } is the clamped off.
+	const responses: Record<string, unknown> = {
+		model: "Qwen3.8-27B",
+		input: "hi",
+		stream: true,
+		reasoning: { effort: "low" },
+	};
+	check("hardoff: responses wire rewritten", applyHardOff(responses, undefined) === true);
+	check("hardoff: responses wire strips reasoning effort", responses.reasoning === undefined);
+	check(
+		"hardoff: responses wire forces enable_thinking:false",
+		(responses.chat_template_kwargs as Record<string, unknown> | undefined)?.enable_thinking === false,
+	);
+
+	// Completions wire (pi): top-level enable_thinking + reasoning_effort.
+	const completions: Record<string, unknown> = {
+		model: "qwen3-30b-a3b",
+		messages: [{ role: "user", content: "hi" }],
+		enable_thinking: true,
+		reasoning_effort: "low",
+		chat_template_kwargs: { reasoning_effort: "low" },
+	};
+	check("hardoff: completions wire rewritten", applyHardOff(completions, undefined) === true);
+	check("hardoff: completions wire strips top-level effort", completions.reasoning_effort === undefined);
+	check("hardoff: completions wire flips enable_thinking", completions.enable_thinking === false);
+	const ck = completions.chat_template_kwargs as Record<string, unknown>;
+	check("hardoff: completions wire kwargs forced off", ck.enable_thinking === false && ck.reasoning_effort === undefined);
+
+	// Existing kwargs are preserved.
+	const merged: Record<string, unknown> = {
+		model: "Qwen3.8-27B",
+		chat_template_kwargs: { add_generation_prompt: true },
+	};
+	applyHardOff(merged, undefined);
+	const mk = merged.chat_template_kwargs as Record<string, unknown>;
+	check("hardoff: existing kwargs preserved", mk.add_generation_prompt === true && mk.enable_thinking === false);
+
+	// Non-Qwen model: untouched.
+	const other: Record<string, unknown> = {
+		model: "KAT-Coder-V2.5-Dev",
+		reasoning: { effort: "low" },
+	};
+	check("hardoff: non-qwen payload untouched", applyHardOff(other, { id: "llama.cpp" }) === false);
+	check("hardoff: non-qwen keeps reasoning field", other.reasoning !== undefined);
+	check("hardoff: non-qwen gets no kwargs", other.chat_template_kwargs === undefined);
+
+	// Session model identity gates when the payload has no model field.
+	const bySession: Record<string, unknown> = { reasoning: { effort: "low" } };
+	check("hardoff: session model identity gates", applyHardOff(bySession, { id: "Qwen3.8-27B", provider: "llama.cpp" }) === true);
+
+	// Idempotent.
+	const once: Record<string, unknown> = { model: "qwen3.8-27b", reasoning: { effort: "low" } };
+	applyHardOff(once, undefined);
+	const snapshot = JSON.stringify(once);
+	applyHardOff(once, undefined);
+	check("hardoff: idempotent", JSON.stringify(once) === snapshot);
+}
+
 process.exit(fail === 0 ? 0 : 1);
